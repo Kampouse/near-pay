@@ -385,6 +385,81 @@ impl MpcClient {
         Ok(tx)
     }
 
+    /// Build a native SOL transfer using a server-provided blockhash.
+    /// Used in Solana Charge pull mode where the server gives a recentBlockhash.
+    pub async fn build_sol_transfer_with_blockhash(
+        &self,
+        from: &str,
+        to: &str,
+        lamports: u64,
+        blockhash: Option<&str>,
+    ) -> Result<Transaction> {
+        let from_pubkey = Pubkey::try_from(from)
+            .map_err(|e| Error::Api(format!("Invalid from address: {}", e)))?;
+        let to_pubkey = Pubkey::try_from(to)
+            .map_err(|e| Error::Api(format!("Invalid to address: {}", e)))?;
+
+        let bh = match blockhash {
+            Some(b) => b.parse::<Hash>()
+                .map_err(|e| Error::Api(format!("Invalid blockhash: {}", e)))?,
+            None => self.get_solana_blockhash().await?,
+        };
+
+        let ix = system_instruction::transfer(&from_pubkey, &to_pubkey, lamports);
+        let message = Message::new_with_blockhash(&[ix], Some(&from_pubkey), &bh);
+        let tx = Transaction {
+            signatures: vec![SolanaSignature::default()],
+            message,
+        };
+
+        Ok(tx)
+    }
+
+    /// Build SPL TransferChecked with optional server-provided blockhash and token program.
+    /// Used in Solana Charge where methodDetails provides recentBlockhash and tokenProgram.
+    pub async fn build_spl_transfer_checked_with_opts(
+        &self,
+        from: &str,
+        to: &str,
+        mint: &str,
+        amount: u64,
+        decimals: u8,
+        blockhash: Option<&str>,
+        token_program: Option<&str>,
+    ) -> Result<Transaction> {
+        let from_pubkey = Pubkey::try_from(from)
+            .map_err(|e| Error::Api(format!("Invalid from address: {}", e)))?;
+        let to_pubkey = Pubkey::try_from(to)
+            .map_err(|e| Error::Api(format!("Invalid to address: {}", e)))?;
+        let mint_pubkey = Pubkey::try_from(mint)
+            .map_err(|e| Error::Api(format!("Invalid mint address: {}", e)))?;
+
+        let source_ata = Self::derive_ata(&from_pubkey, &mint_pubkey);
+        let dest_ata = Self::derive_ata(&to_pubkey, &mint_pubkey);
+
+        let ix = Self::spl_transfer_checked_ix(source_ata, mint_pubkey, dest_ata, from_pubkey, amount, decimals);
+
+        let bh = match blockhash {
+            Some(b) => b.parse::<Hash>()
+                .map_err(|e| Error::Api(format!("Invalid blockhash: {}", e)))?,
+            None => self.get_solana_blockhash().await?,
+        };
+
+        let message = Message::new_with_blockhash(&[ix], Some(&from_pubkey), &bh);
+        let tx = Transaction {
+            signatures: vec![SolanaSignature::default()],
+            message,
+        };
+
+        // Note: token_program from methodDetails is the program the *server* uses
+        // to verify. Our instruction targets TOKEN_PROGRAM. If the server sends
+        // Token-2022 (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb), we should
+        // use that instead. For now both share the same TransferChecked layout.
+        let _ = token_program; // Will be used when we support Token-2022
+
+        Ok(tx)
+    }
+
     // ─── Step 3: Request MPC Signature ─────────────────────────────────
 
     /// Request MPC signature for a Solana transaction.

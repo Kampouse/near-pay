@@ -63,49 +63,48 @@ async fn sign_sol_payment(
     asset: &str,
     decimals: Option<u8>,
     fee_payer: Option<&str>,
+    recent_blockhash: Option<&str>,
+    token_program: Option<&str>,
     relay: bool,
 ) -> Result<SignedPayment> {
-    // Balance gate: check before building tx
-    let balance = mpc.sol_balance(sol_addr).await?;
-    let needed = if asset == crate::mpc::SOL_NATIVE {
-        amount + 10_000_000 // payment + rent reserve
-    } else {
-        10_000_000 // SPL transfer only needs gas
-    };
-    if balance < needed {
-        let asset_name: &'static str = if asset == crate::mpc::SOL_NATIVE {
-            "SOL"
+    // Balance gate: skip in pull mode (server pays gas)
+    let is_pull = fee_payer.is_some();
+    if !is_pull {
+        let balance = mpc.sol_balance(sol_addr).await?;
+        let needed = if asset == crate::mpc::SOL_NATIVE {
+            amount + 10_000_000 // payment + rent reserve
         } else {
-            "SPL"
+            10_000_000 // SPL transfer only needs gas
         };
-        return Err(Error::InsufficientBalance {
-            asset: asset_name,
-            needed,
-            available: balance,
-        });
+        if balance < needed {
+            let asset_name: &'static str = if asset == crate::mpc::SOL_NATIVE {
+                "SOL"
+            } else {
+                "SPL"
+            };
+            return Err(Error::InsufficientBalance {
+                asset: asset_name,
+                needed,
+                available: balance,
+            });
+        }
     }
 
     // Build the transfer instruction
     let tx = if asset == crate::mpc::SOL_NATIVE {
-        mpc.build_sol_transfer(sol_addr, pay_to, amount).await?
+        mpc.build_sol_transfer_with_blockhash(sol_addr, pay_to, amount, recent_blockhash).await?
     } else {
-        mpc.build_spl_transfer_checked(sol_addr, pay_to, asset, amount, decimals.unwrap_or(6)).await?
-    };
-
-    // If fee payer is provided (pull mode), set the fee payer on the tx
-    // The server will co-sign with its fee payer key before broadcasting
-    let tx = if let Some(_fp) = fee_payer {
-        // TODO: set tx.message.account_keys[0] = fee_payer
-        // For now the server handles this
-        tx
-    } else {
-        tx
+        mpc.build_spl_transfer_checked_with_opts(
+            sol_addr, pay_to, asset, amount,
+            decimals.unwrap_or(6),
+            recent_blockhash,
+            token_program,
+        ).await?
     };
 
     let signature = mpc.sign_transaction(&tx, PAY_SOL_PATH).await?;
     let signed_bytes = mpc.finalize_transaction(&tx, sol_addr, &signature)?;
 
-    // The tx signature is the first (only) signature on the signed tx
     let tx_sig = bs58::encode(&signature).into_string();
     let signed_b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
 
@@ -128,7 +127,7 @@ async fn execute_sol_payment(
     amount: u64,
     asset: &str,
 ) -> Result<String> {
-    let payment = sign_sol_payment(mpc, custody, sol_addr, pay_to, amount, asset, None, None, true).await?;
+    let payment = sign_sol_payment(mpc, custody, sol_addr, pay_to, amount, asset, None, None, None, None, true).await?;
     Ok(payment.tx_signature)
 }
 
@@ -211,6 +210,8 @@ impl PaymentProvider for MpcSolanaProvider {
             asset,
             if !is_native { Some(req.decimals()) } else { None },
             req.fee_payer_key(),
+            req.method_details.as_ref().and_then(|m| m.recent_blockhash.as_deref()),
+            req.method_details.as_ref().and_then(|m| m.token_program.as_deref()),
             !is_pull, // relay only in push mode
         )
         .await
@@ -725,6 +726,8 @@ impl PayClient {
             asset,
             if !is_native { Some(req.decimals()) } else { None },
             req.fee_payer_key(),
+            req.method_details.as_ref().and_then(|m| m.recent_blockhash.as_deref()),
+            req.method_details.as_ref().and_then(|m| m.token_program.as_deref()),
             !is_pull,
         ).await?;
 
