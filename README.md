@@ -2,7 +2,35 @@
 
 Multi-chain payments for AI agents on NEAR.
 
-One Rust crate. One wallet. Any chain. Pay for APIs with HTTP 402. Send SOL, ETH, BTC, or NEAR-native tokens to anyone. Self-healing balance management.
+One Rust crate + CLI. One wallet. Any chain. Pay for APIs with HTTP 402. Send SOL, ETH, BTC, or NEAR-native tokens to anyone. Self-healing balance management.
+
+## CLI
+
+```sh
+cargo install --path .
+
+# Discover providers (75 APIs on pay.sh)
+agent-pay search "ocr"
+agent-pay search "stock price"
+agent-pay list
+agent-pay info solana-foundation/alibaba/ocr-api
+
+# Call by FQN — resolves service_url from pay.sh catalog
+agent-pay quicknode/rpc '{"method":"getHealth"}'
+
+# Pipe body from stdin
+echo '{"image":"base64..."}' | agent-pay alibaba/ocr-api
+
+# Call any URL directly
+agent-pay https://payment-debugger.vercel.app/mpp/quote/AAPL
+
+# Fuzzy match — one word is enough if unambiguous
+agent-pay quicknode
+```
+
+Requires `OUTLAYER_API_KEY=wk_...` for payments. Catalog commands (search/list/info) work without it.
+
+Response body goes to stdout. Diagnostics and payment info go to stderr. Pipe-friendly.
 
 ## How it works
 
@@ -112,7 +140,13 @@ MpcClient
   │
   ├─ build_transfer(from, to, amount, asset)
   │   ├─ SOL_NATIVE → SystemProgram::transfer
-  │   └─ mint addr  → Token Transfer (ix 12) + ATA derivation
+  │   └─ mint addr  → Token TransferChecked (ix 13) + ATA derivation
+  │
+  ├─ build_sol_transfer_with_blockhash(from, to, lamports, bh)
+  │   └─ Use server-provided blockhash (Solana Charge pull mode)
+  │
+  ├─ build_spl_transfer_checked_with_opts(from, to, mint, amt, dec, bh, tp)
+  │   └─ Server-provided blockhash + token program (Token-2022 ready)
   │
   ├─ sign_transaction(tx, "solana-1")
   │   → POST /wallet/v1/call → v1.signer payload_v2 Ed25519
@@ -163,7 +197,9 @@ custody.policy()                           // Read approval policy
 ```rust
 mpc.derive_solana_address(path)            // View call to v1.signer
 mpc.build_sol_transfer(from, to, lamports) // Build SOL transfer tx
-mpc.build_spl_transfer(from, to, mint, amt)// Build SPL token tx
+mpc.build_sol_transfer_with_blockhash(...) // Build SOL tx with server blockhash
+mpc.build_spl_transfer_checked(...)        // Build SPL TransferChecked tx (ix 13)
+mpc.build_spl_transfer_checked_with_opts(...)// SPL tx with server blockhash + token program
 mpc.build_transfer(from, to, amt, asset)   // Router: SOL or SPL
 mpc.sign_transaction(tx, path)             // MPC sign via v1.signer
 mpc.finalize_transaction(tx, from, sig)    // Attach signature
@@ -188,16 +224,19 @@ mpc.build_transfer(from, to, 1000000, USDC_MINT).await?;
 mpc.build_transfer(from, to, 500000, "EPjFWdd5...wyTDt1v").await?;
 ```
 
-Internally: `derive_ata()` for source/dest ATAs, then Token Program instruction 12 (Transfer) with 12-byte data encoding.
+Internally: `derive_ata()` for source/dest ATAs, then Token Program instruction 13 (TransferChecked) with 13-byte data encoding (4-byte discriminator + 8-byte amount + 1-byte decimals).
+
+Server-provided blockhash and token program are passed through when available (Solana Charge pull mode). The `methodDetails.recentBlockhash` from pay.sh is used instead of fetching our own — saves an RPC call and matches what the server expects for verification.
 
 ## File structure
 
 ```
 src/
+├── main.rs      — CLI binary (search, list, info, call)
 ├── lib.rs       — Re-exports, Result type
 ├── custody.rs   — OutLayer REST client (~440 lines)
-├── mpc.rs       — MPC signing + Solana tx building (~720 lines)
-├── x402.rs      — PayClient + MPP + x402 + auto-fund (~920 lines)
+├── mpc.rs       — MPC signing + Solana tx building (~890 lines)
+├── x402.rs      — PayClient + MPP + x402 + auto-fund (~1500 lines)
 ├── types.rs     — Request/Response types, CrossChainResult, SendResult
 └── error.rs     — Error types (Api, Http, X402, InsufficientBalance, Policy)
 ```
@@ -213,6 +252,14 @@ ed25519-dalek = "2"       # Ed25519 types
 ```
 
 Notably absent: `x402-rs` and `solana-mpp`. Both have atomic crate conflicts with `solana-sdk v2`. We hand-roll x402 parsing and use the `mpp` crate for MPP only.
+
+## Testing
+
+```sh
+cargo test                       # 19 unit tests
+cargo test test_paysh_integration -- --ignored    # Parse real pay.sh 402
+OUTLAYER_API_KEY=wk_... cargo test test_paysh_e2e -- --ignored --nocapture  # Full MPC sign + submit
+```
 
 ## Current blockers
 
