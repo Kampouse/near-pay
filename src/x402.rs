@@ -1154,4 +1154,205 @@ mod tests {
     fn test_derivation_path_constant() {
         assert!(PAY_SOL_PATH.starts_with("solana-"));
     }
+
+    /// Integration test: hit real pay.sh endpoint, parse 402, build credential.
+    ///
+    /// Run with: cargo test test_paysh_integration -- --ignored
+    ///
+    /// Tests the full flow WITHOUT actually signing or paying:
+    /// 1. HTTP GET to payment-debugger.vercel.app → 402
+    /// 2. Parse WWW-Authenticate: Payment header
+    /// 3. Decode base64 request → SolanaChargeRequest
+    /// 4. Verify methodDetails structure (decimals, feePayer, feePayerKey, etc.)
+    /// 5. Build TransferChecked ix with server blockhash
+    /// 6. Format Solana Charge credential JSON
+    /// 7. Verify credential structure matches spec
+    #[test]
+    #[ignore]
+    fn test_paysh_integration() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 1. Hit real pay.sh endpoint
+            let client = reqwest::Client::new();
+            let resp = client
+                .get("https://payment-debugger.vercel.app/mpp/quote/AAPL")
+                .send()
+                .await
+                .expect("Failed to connect to payment-debugger");
+
+            let status = resp.status().as_u16();
+            assert_eq!(status, 402, "Expected 402, got {}", status);
+
+            let www_auth = resp
+                .headers()
+                .get("www-authenticate")
+                .expect("Missing WWW-Authenticate header")
+                .to_str()
+                .expect("Non-ASCII in WWW-Authenticate")
+                .to_string();
+
+            // 2. Parse the MPP challenge header
+            assert!(
+                www_auth.starts_with("Payment "),
+                "WWW-Authenticate should start with 'Payment ', got: {}",
+                &www_auth[..20.min(www_auth.len())]
+            );
+
+            // Extract key params from the header
+            assert!(
+                www_auth.contains("method=\"solana\""),
+                "Expected method=\"solana\" in header"
+            );
+            assert!(
+                www_auth.contains("intent=\"charge\""),
+                "Expected intent=\"charge\" in header"
+            );
+
+            // Find the request= parameter (base64-encoded JSON)
+            let request_b64 = extract_param(&www_auth, "request")
+                .expect("Missing request= parameter in WWW-Authenticate");
+
+            // 3. Decode base64 → JSON → SolanaChargeRequest
+            let request_json_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&request_b64)
+                .unwrap_or_else(|_| {
+                    // Try URL-safe no-pad
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&request_b64)
+                        .expect("Failed to decode request as base64")
+                });
+
+            let request_json: serde_json::Value = serde_json::from_slice(&request_json_bytes)
+                .expect("Failed to parse request as JSON");
+
+            let req: SolanaChargeRequest = serde_json::from_value(request_json.clone())
+                .expect("Failed to deserialize SolanaChargeRequest");
+
+            // 4. Verify the real pay.sh structure
+            assert!(!req.recipient.is_empty(), "Empty recipient");
+            assert!(!req.amount.is_empty(), "Empty amount");
+            assert!(
+                req.currency.is_some(),
+                "pay.sh always sends currency"
+            );
+            assert!(
+                !req.is_native_sol(),
+                "payment-debugger charges USDC, not SOL"
+            );
+
+            // methodDetails must exist and be populated
+            let details = req.method_details.as_ref()
+                .expect("pay.sh sends methodDetails");
+
+            assert_eq!(details.decimals, Some(6), "USDC has 6 decimals");
+            assert_eq!(details.fee_payer, Some(true), "payment-debugger uses pull mode");
+            assert!(details.fee_payer_key.is_some(), "feePayerKey required for pull mode");
+            assert!(details.recent_blockhash.is_some(), "recentBlockhash must be present");
+            assert!(details.token_program.is_some(), "tokenProgram must be present");
+
+            // Verify helper methods
+            assert!(req.is_pull(), "feePayer=true should be pull mode");
+            assert_eq!(req.decimals(), 6);
+            let (asset, is_native) = req.resolve();
+            assert!(!is_native);
+            // Should be USDC mint
+            assert_eq!(asset, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+            // 5. Build TransferChecked ix using server blockhash
+            let from_pubkey = solana_sdk::pubkey::Pubkey::new_unique(); // fake MPC address
+            let to_pubkey = solana_sdk::pubkey::Pubkey::try_from(req.recipient.as_str()).unwrap();
+            let mint_pubkey = solana_sdk::pubkey::Pubkey::try_from(asset).unwrap();
+            let amount: u64 = req.amount.parse().expect("Invalid amount");
+
+            let _ix = crate::mpc::MpcClient::spl_transfer_checked_ix(
+                from_pubkey,
+                mint_pubkey,
+                to_pubkey,
+                from_pubkey,
+                amount,
+                req.decimals(),
+            );
+
+            // Verify instruction 13 encoding
+            // (checked in unit tests, but confirm with real amount)
+            assert_eq!(_ix.data.len(), 13);
+            assert_eq!(u32::from_le_bytes(_ix.data[0..4].try_into().unwrap()), 13);
+            assert_eq!(u64::from_le_bytes(_ix.data[4..12].try_into().unwrap()), amount);
+            assert_eq!(_ix.data[12], 6u8); // decimals
+
+            // 6. Format Solana Charge credential JSON (pull mode)
+            let fake_signed_tx_b64 = base64::engine::general_purpose::STANDARD
+                .encode(vec![0u8; 64]); // fake signed tx
+
+            let credential_json = serde_json::json!({
+                "challenge": {
+                    "id": "test-id",
+                    "method": "solana",
+                    "intent": "charge",
+                },
+                "payload": {
+                    "type": "transaction",
+                    "transaction": fake_signed_tx_b64,
+                }
+            });
+
+            let cred_str = serde_json::to_string(&credential_json).unwrap();
+            let cred_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cred_str);
+
+            // 7. Verify credential structure
+            let decoded: serde_json::Value = serde_json::from_str(
+                &String::from_utf8(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&cred_b64)
+                        .unwrap()
+                ).unwrap()
+            ).unwrap();
+
+            assert_eq!(decoded["payload"]["type"], "transaction");
+            assert!(decoded["payload"]["transaction"].is_string());
+
+            // The Authorization header would be:
+            let auth_header = format!("Payment {}", cred_b64);
+            assert!(auth_header.starts_with("Payment "));
+            assert!(auth_header.len() > 50, "Credential should be substantial");
+
+            println!("=== pay.sh integration test PASSED ===");
+            println!("Recipient: {}", req.recipient);
+            println!("Amount: {} (USDC lamports)", req.amount);
+            println!("Fee payer: {:?}", details.fee_payer_key);
+            println!("Blockhash: {:?}", details.recent_blockhash);
+            println!("Token program: {:?}", details.token_program);
+            println!("Pull mode: {}", req.is_pull());
+            println!("Credential header length: {} bytes", auth_header.len());
+        });
+    }
+
+    /// Extract a parameter value from the WWW-Authenticate header.
+    /// Handles both quoted and unquoted values.
+    fn extract_param(header: &str, key: &str) -> Option<String> {
+        let prefix = format!("{}=", key);
+        for part in header.split(',') {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix(&prefix) {
+                // Strip quotes if present
+                let val = rest.strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(rest);
+                return Some(val.to_string());
+            }
+        }
+        // Also try space-separated (first param has no comma)
+        for part in header.split(' ') {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix(&prefix) {
+                let val = rest.strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(rest);
+                // Strip trailing comma if present
+                let val = val.strip_suffix(',').unwrap_or(val);
+                return Some(val.to_string());
+            }
+        }
+        None
+    }
 }

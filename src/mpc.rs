@@ -273,7 +273,7 @@ impl MpcClient {
     /// Wire format:
     /// - Accounts: [source_ata (writable), mint (readonly), dest_ata (writable), owner]
     /// - Data: 4 bytes discriminator (13u32 LE) + 8 bytes amount LE + 1 byte decimals
-    fn spl_transfer_checked_ix(
+    pub fn spl_transfer_checked_ix(
         source: Pubkey,
         mint: Pubkey,
         destination: Pubkey,
