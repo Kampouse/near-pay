@@ -291,23 +291,26 @@ let data = custody.fetch_paid("https://api.example.com/data", max_sol: 0.001).aw
 
 The agent never sees the payment mechanics. It just gets the data.
 
-**Phase 5: Policy as code**
+**Phase 5: Policy engine — prevent agents from going wild**
 
-Replace the dashboard approval with programmable policies:
+Programmable guardrails so the agent can't drain the wallet or pay random addresses:
 
 ```rust
-// Auto-approve sends under 1 NEAR equivalent
+// Auto-approve small routine payments
 policy.auto_approve(|req| req.usd_value() < 1.0);
 
-// Require explicit approval for sends over 10 NEAR
+// Require explicit approval for large sends
 policy.require_approval(|req| req.usd_value() >= 10.0);
 
-// Whitelist specific API domains for 402
+// Only pay whitelisted API domains
 policy.allow_402_domain("api.openai.com");
 policy.allow_402_domain("api.anthropic.com");
+
+// Only send to whitelisted addresses
+policy.allow_destination("solana", "GCn6...WzViH");
 ```
 
-Policies execute inside the TEE. No human in the loop unless the policy says so.
+The policy runs inside the TEE. The agent can't bypass it. If it tries something outside policy bounds, it gets rejected. No human in the loop unless the policy says so.
 
 ### What agent-pay becomes
 
