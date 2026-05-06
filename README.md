@@ -241,13 +241,11 @@ agent-pay is an external client that calls OutLayer's REST API. Everything it do
 
 1. **No API key** — the TEE already holds the identity. No `wk_4f3e...` key to leak or rotate.
 
-2. **Policy-as-code replaces manual approval** — the TEE runs programmable policies. Instead of a human approving each withdraw in a dashboard, the agent's policy auto-approves expected operations (payments under X, whitelisted chains) and escalates unusual ones. Cross-chain sends become instant for approved operations.
+2. **No external signing roundtrip** — MPC signing is already inside the TEE. No REST call to yourself. Just call the contract directly.
 
-3. **No external signing roundtrip** — MPC signing is already inside the TEE. No REST call to yourself. Just call the contract directly.
+3. **Self-healing is trivial** — the TEE can monitor its own Solana balance and refill from Intents without polling.
 
-4. **Self-healing is trivial** — the TEE can monitor its own Solana balance and refill from Intents without polling.
-
-5. **x402/MPP becomes a TEE capability** — the agent asks "pay this API" and the TEE handles everything: detect protocol, sign, relay, retry.
+4. **x402/MPP becomes a TEE capability** — the agent asks "pay this API" and the TEE handles everything: detect protocol, sign, relay, retry.
 
 ### Implementation path
 
