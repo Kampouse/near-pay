@@ -1,4 +1,4 @@
-# PLAN: Unified Send API for agent-pay
+# PLAN: Unified Send API for near-pay
 
 ## Architecture
 
@@ -241,7 +241,7 @@ pay.mpc()                                     // Access underlying MpcClient
 ## File Structure
 
 ```
-agent-pay/src/
+near-pay/src/
 ├── lib.rs          — Re-exports: CustodyClient, MpcClient, PayClient, USDC_MINT, SOL_NATIVE
 ├── custody.rs      — OutLayer REST client (~350 lines)
 ├── mpc.rs          — NEAR MPC chain signatures + Solana tx building (~720 lines)

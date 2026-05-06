@@ -1,4 +1,4 @@
-# SKILL.md — agent-pay
+# SKILL.md — near-pay
 
 Multi-chain payment library + CLI for AI agents. NEAR custody (OutLayer) + MPC chain signatures (v1.signer) + pay.sh HTTP 402.
 
@@ -69,7 +69,7 @@ OUTLAYER_API_KEY=wk_... cargo test test_paysh_e2e -- --ignored --nocapture  # Fu
 
 Files synced to temp dir before git push (avoids .gitignore issues):
 ```sh
-rsync -av src/ /var/folders/tf/qhb6jyw95v9fbwnvs30cc6y00000gn/T/agent-pay-publish/src/
-cp Cargo.toml Cargo.lock README.md SKILL.md /var/folders/tf/.../T/agent-pay-publish/
-cd /var/folders/tf/.../T/agent-pay-publish && git add -A && git commit -m "..." && git push
+rsync -av src/ /var/folders/tf/qhb6jyw95v9fbwnvs30cc6y00000gn/T/near-pay-publish/src/
+cp Cargo.toml Cargo.lock README.md SKILL.md /var/folders/tf/.../T/near-pay-publish/
+cd /var/folders/tf/.../T/near-pay-publish && git add -A && git commit -m "..." && git push
 ```

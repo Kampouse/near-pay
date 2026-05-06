@@ -1,4 +1,4 @@
-# agent-pay
+# near-pay
 
 Multi-chain payments for AI agents on NEAR.
 
@@ -34,7 +34,7 @@ Response body goes to stdout. Diagnostics and payment info go to stderr. Pipe-fr
 
 ## How it works
 
-agent-pay sits between your agent and the financial infrastructure. It wraps two NEAR primitives into a single payment layer:
+near-pay sits between your agent and the financial infrastructure. It wraps two NEAR primitives into a single payment layer:
 
 **OutLayer Agent Custody** — a multi-chain wallet held in TEE. Holds NEAR, ETH, BTC, SOL balances. Exposes a REST API for transfers, swaps, and cross-chain withdrawals via NEAR Intents.
 
@@ -64,7 +64,7 @@ your agent
 
 ### 1. Pay for API access (HTTP 402)
 
-An API returns 402 with payment requirements. agent-pay detects the protocol, signs a Solana transaction via MPC, relays it, and retries the request with payment proof.
+An API returns 402 with payment requirements. near-pay detects the protocol, signs a Solana transaction via MPC, relays it, and retries the request with payment proof.
 
 Two protocols supported:
 
@@ -271,11 +271,11 @@ OUTLAYER_API_KEY=wk_... cargo test test_paysh_e2e -- --ignored --nocapture  # Fu
 
 ## How to implement this in OutLayer directly
 
-agent-pay is an external client that calls OutLayer's REST API. Everything it does could be moved inside OutLayer's TEE, eliminating the external dependency and making the whole flow trustless.
+near-pay is an external client that calls OutLayer's REST API. Everything it does could be moved inside OutLayer's TEE, eliminating the external dependency and making the whole flow trustless.
 
-### What agent-pay does externally that OutLayer could do natively
+### What near-pay does externally that OutLayer could do natively
 
-| agent-pay (external) | OutLayer (native) |
+| near-pay (external) | OutLayer (native) |
 |---|---|
 | REST call to `/wallet/v1/call` for MPC signing | Direct contract call inside TEE |
 | REST call to `/wallet/v1/address` for address derivation | Local key derivation in TEE |
@@ -314,7 +314,7 @@ This removes the API key, the HTTP latency, and the trust-on-first-use REST auth
 The TEE adds a Solana RPC client. After signing, it relays directly instead of returning the signed tx to the external client.
 
 ```
-Current:  TEE signs → returns signed tx → agent-pay relays to Solana
+Current:  TEE signs → returns signed tx → near-pay relays to Solana
 Native:   TEE signs → TEE relays to Solana → returns tx_hash
 ```
 
@@ -323,7 +323,7 @@ Native:   TEE signs → TEE relays to Solana → returns tx_hash
 Cross-chain sends happen inside the TEE. No `pending_approval` — the TEE's policy engine decides. No polling — event-driven via NEAR receipts.
 
 ```
-Current:  agent-pay → REST withdraw → poll → poll → completed
+Current:  near-pay → REST withdraw → poll → poll → completed
 Native:   TEE → NEAR Intents deposit → NEAR Intents withdraw → callback → done
 ```
 
@@ -356,9 +356,9 @@ policy.allow_402_domain("api.anthropic.com");
 
 Policies execute inside the TEE. No human in the loop unless the policy says so.
 
-### What agent-pay becomes
+### What near-pay becomes
 
-After native integration, agent-pay shrinks to a thin SDK:
+After native integration, near-pay shrinks to a thin SDK:
 
 ```rust
 // Before (external client, ~3000 lines)
@@ -383,4 +383,4 @@ All the signing, relaying, polling, and auto-funding moves inside the TEE. The S
 4. **402 primitive** — highest-level abstraction, depends on 1-3
 5. **Policy engine** — can be done in parallel with 3-4
 
-agent-pay can remain as the external client during migration. Once a phase is native, we swap the REST call for a TEE call. One phase at a time. No big bang.
+near-pay can remain as the external client during migration. Once a phase is native, we swap the REST call for a TEE call. One phase at a time. No big bang.
