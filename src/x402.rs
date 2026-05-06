@@ -107,14 +107,15 @@ impl MpcSolanaProvider {
 
 impl PaymentProvider for MpcSolanaProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "solanampc" && intent == "charge"
+        // draft-solana-charge-00: method="solana", intent="charge"
+        method == "solana" && intent == "charge"
     }
 
     async fn pay(
         &self,
         challenge: &PaymentChallenge,
     ) -> std::result::Result<PaymentCredential, mpp::error::MppError> {
-        let req: MppChargeRequest = challenge
+        let req: SolanaChargeRequest = challenge
             .request
             .decode()
             .map_err(|e| mpp::error::MppError::InvalidChallenge {
@@ -127,11 +128,6 @@ impl PaymentProvider for MpcSolanaProvider {
             .await
             .map_err(|e| mpp::error::MppError::Http(format!("Failed to derive address: {}", e)))?;
 
-        let pay_to = req.pay_to.ok_or_else(|| mpp::error::MppError::InvalidChallenge {
-            id: Some(challenge.id.clone()),
-            reason: Some("No pay_to in charge request".into()),
-        })?;
-
         let amount: u64 = req
             .amount
             .parse()
@@ -140,33 +136,70 @@ impl PaymentProvider for MpcSolanaProvider {
                 reason: Some(format!("Invalid amount: {}", e)),
             })?;
 
-        // Default to native SOL if no token specified
-        let asset = req
-            .token
-            .as_deref()
-            .unwrap_or(crate::mpc::SOL_NATIVE);
+        // Resolve asset: native SOL or SPL token mint
+        let (asset, _is_native) = req.resolve();
 
-        let tx_hash = execute_sol_payment(&self.mpc, &self.custody, &sol_addr, &pay_to, amount, asset)
+        let tx_hash = execute_sol_payment(&self.mpc, &self.custody, &sol_addr, &req.recipient, amount, asset)
             .await
             .map_err(|e| mpp::error::MppError::Http(format!("Payment failed: {}", e)))?;
 
+        // Build Solana Charge credential (push mode: signature)
         let echo = challenge.to_echo();
         Ok(PaymentCredential::new(
             echo,
-            MppPayload::hash(format!("0x{}", tx_hash)),
+            MppPayload::hash(tx_hash),
         ))
     }
 }
-
-// ─── MPP charge request (WWW-Authenticate) ───────────────────────────
-
-/// Charge request inside MPP `WWW-Authenticate: Payment` header.
+///
+/// Per draft-solana-charge-00:
+/// - `recipient`: base58-encoded pubkey receiving payment
+/// - `amount`: integer amount in base units
+/// - `currency`: "sol" for native, or base58 mint address for SPL tokens
+/// - `decimals`: required for SPL tokens (0–9)
+/// - `feePayerKey`: optional, server-sponsored fees
+/// - `externalId`: optional memo
 #[derive(Debug, Deserialize)]
-pub struct MppChargeRequest {
+pub struct SolanaChargeRequest {
+    pub recipient: String,
     pub amount: String,
-    pub pay_to: Option<String>,
-    pub token: Option<String>,
-    pub network: Option<String>,
+    /// "sol" for native SOL, or base58 mint address (e.g. USDC)
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// Required when currency is a mint address
+    #[serde(default)]
+    pub decimals: Option<u8>,
+    /// Server fee payer key (pull mode — server broadcasts)
+    #[serde(default, rename = "feePayerKey")]
+    pub fee_payer_key: Option<String>,
+    #[serde(default, rename = "externalId")]
+    pub external_id: Option<String>,
+}
+
+impl SolanaChargeRequest {
+    /// Whether this is a native SOL payment.
+    pub fn is_native_sol(&self) -> bool {
+        self.currency.as_deref() == Some("sol") || self.currency.is_none()
+    }
+
+    /// Resolve the currency to a static asset string.
+    /// For native SOL → SOL_NATIVE. For SPL tokens → USDC_MINT or the raw mint.
+    /// Returns (asset_str, is_native).
+    ///
+    /// Note: for arbitrary SPL mints, the caller should use `self.currency` directly
+    /// since we can't return `&'static str` for a dynamic string.
+    pub fn resolve(&self) -> (&str, bool) {
+        if self.is_native_sol() {
+            (crate::mpc::SOL_NATIVE, true)
+        } else {
+            // Return the currency (mint address) from the struct
+            // Default to USDC if no currency specified and somehow not native
+            match self.currency.as_deref() {
+                Some(mint) => (mint, false),
+                None => (crate::mpc::USDC_MINT, false),
+            }
+        }
+    }
 }
 
 // ─── x402 charge types (JSON body) ──────────────────────────────────
@@ -522,14 +555,11 @@ impl PayClient {
             Err(_) => "0".to_string(),
         };
 
-        let req: MppChargeRequest = challenge
+        let req: SolanaChargeRequest = challenge
             .request
             .decode()
             .map_err(|e| Error::X402(format!("MPP decode error: {}", e)))?;
 
-        let pay_to = req
-            .pay_to
-            .ok_or_else(|| Error::X402("No pay_to in MPP challenge".into()))?;
         let amount: u64 = req
             .amount
             .parse()
@@ -538,21 +568,18 @@ impl PayClient {
         self.ensure_sol_address().await?;
         let sol_addr = self.ensure_sol_address().await?.to_string();
 
-        // Default to native SOL if no token specified
-        let asset = req
-            .token
-            .as_deref()
-            .unwrap_or(crate::mpc::SOL_NATIVE);
+        // Resolve asset from Solana Charge fields
+        let (asset, _is_native) = req.resolve();
 
         // Auto-fund if balance too low
-        let needed = if asset == crate::mpc::SOL_NATIVE { amount } else { 0 };
+        let needed = if req.is_native_sol() { amount } else { 0 };
         let _ = self.ensure_funded(&sol_addr, needed).await;
 
-        let tx_hash = execute_sol_payment(&self.mpc, &self.custody, &sol_addr, &pay_to, amount, asset).await?;
+        let tx_hash = execute_sol_payment(&self.mpc, &self.custody, &sol_addr, &req.recipient, amount, asset).await?;
 
         let credential = PaymentCredential::new(
             challenge.to_echo(),
-            MppPayload::hash(format!("0x{}", tx_hash)),
+            MppPayload::hash(tx_hash),
         );
         let auth_header = mpp::protocol::core::format_authorization(&credential)
             .map_err(|e| Error::X402(format!("MPP credential error: {}", e)))?;
@@ -737,23 +764,37 @@ mod tests {
         let mpc = MpcClient::new(custody.clone_for_mpc(), true);
         let provider = MpcSolanaProvider::new(mpc, custody);
 
-        assert!(provider.supports("solanampc", "charge"));
+        assert!(provider.supports("solana", "charge"));
         assert!(!provider.supports("tempo", "charge"));
-        assert!(!provider.supports("solanampc", "session"));
+        assert!(!provider.supports("solana", "session"));
     }
 
     #[test]
-    fn test_mpp_charge_request_decode() {
+    fn test_solana_charge_request_decode() {
         let json = serde_json::json!({
+            "recipient": "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH",
             "amount": "1000000",
-            "pay_to": "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH",
+            "currency": "sol"
         });
-        let req: MppChargeRequest = serde_json::from_value(json).unwrap();
+        let req: SolanaChargeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.amount, "1000000");
-        assert_eq!(
-            req.pay_to.unwrap(),
-            "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH"
-        );
+        assert_eq!(req.recipient, "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH");
+        assert!(req.is_native_sol());
+    }
+
+    #[test]
+    fn test_solana_charge_request_spl() {
+        let json = serde_json::json!({
+            "recipient": "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH",
+            "amount": "500000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "decimals": 6
+        });
+        let req: SolanaChargeRequest = serde_json::from_value(json).unwrap();
+        assert!(!req.is_native_sol());
+        let (asset, is_native) = req.resolve();
+        assert_eq!(asset, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        assert!(!is_native);
     }
 
     #[test]
@@ -892,12 +933,12 @@ mod tests {
         let request_b64 = base64::engine::general_purpose::STANDARD
             .encode(r#"{"amount":"1000","pay_to":"Abc123"}"#);
         let header = format!(
-            r#"Payment id="test-123", realm="api.example.com", method="solanampc", intent="charge", request="{}""#,
+            r#"Payment id="test-123", realm="api.example.com", method="solana", intent="charge", request="{}""#,
             request_b64
         );
         let challenge = mpp::protocol::core::PaymentChallenge::from_header(&header).unwrap();
         assert_eq!(challenge.id, "test-123");
-        assert_eq!(challenge.method.as_str(), "solanampc");
+        assert_eq!(challenge.method.as_str(), "solana");
         assert_eq!(challenge.intent.as_str(), "charge");
     }
 
@@ -905,7 +946,7 @@ mod tests {
     fn test_mpp_credential_format() {
         let request_b64 = base64::engine::general_purpose::STANDARD.encode("{}");
         let header = format!(
-            r#"Payment id="test-456", realm="api.example.com", method="solanampc", intent="charge", request="{}""#,
+            r#"Payment id="test-456", realm="api.example.com", method="solana", intent="charge", request="{}""#,
             request_b64
         );
         let challenge = mpp::protocol::core::PaymentChallenge::from_header(&header).unwrap();
