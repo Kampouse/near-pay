@@ -25,3 +25,10 @@ http = "1"
 
 # MPP protocol (standard 402 with WWW-Authenticate)
 mpp = { version = "0.10.0", features = ["client"] }
+
+# CLI deps
+atty = "0.2"
+
+[[bin]]
+name = "agent-pay"
+path = "src/main.rs"
