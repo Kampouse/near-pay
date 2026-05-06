@@ -214,11 +214,11 @@ ed25519-dalek = "2"       # Ed25519 types
 
 Notably absent: `x402-rs` and `solana-mpp`. Both have atomic crate conflicts with `solana-sdk v2`. We hand-roll x402 parsing and use the `mpp` crate for MPP only.
 
-## Current blockers
+## Current status
 
-1. **OutLayer withdraw approval** — `intents_withdraw` returns `pending_approval`. Requires manual approval in the OutLayer dashboard. No programmatic API. Blocks auto-fund and cross-chain sends until resolved.
+1. **Withdraw policy** — `intents_withdraw` returns `pending_approval` when the agent's policy doesn't auto-approve the operation. This is by design: OutLayer policies are safeguards that let you control what your agent can do autonomously. Configure auto-approve rules for expected operations (see Phase 5 in the native integration section).
 
-2. **MPC address has 0 SOL** — The balance gate catches this cleanly with `InsufficientBalance`. Auto-fund is wired but blocked by #1. Manual SOL transfer to the MPC address works as a workaround.
+2. **MPC address funding** — The MPC-derived Solana address starts at 0 SOL. The balance gate catches this cleanly with `InsufficientBalance`. Auto-fund is wired and will work once the withdraw policy allows it. Manual SOL transfer to the MPC address works immediately.
 
 ---
 
@@ -241,7 +241,7 @@ agent-pay is an external client that calls OutLayer's REST API. Everything it do
 
 1. **No API key** — the TEE already holds the identity. No `wk_4f3e...` key to leak or rotate.
 
-2. **No pending_approval** — the TEE IS the approval. Policy checks happen inside the enclave, not in a dashboard. Cross-chain sends become instant.
+2. **Policy-as-code replaces manual approval** — the TEE runs programmable policies. Instead of a human approving each withdraw in a dashboard, the agent's policy auto-approves expected operations (payments under X, whitelisted chains) and escalates unusual ones. Cross-chain sends become instant for approved operations.
 
 3. **No external signing roundtrip** — MPC signing is already inside the TEE. No REST call to yourself. Just call the contract directly.
 
@@ -273,11 +273,11 @@ Native:   TEE signs → TEE relays to Solana → returns tx_hash
 
 **Phase 3: Internal Intents**
 
-Cross-chain sends happen inside the TEE. No `pending_approval` — the TEE's policy engine decides. No polling — event-driven via NEAR receipts.
+Cross-chain sends happen inside the TEE. The agent's policy controls auto-approval. No polling — event-driven via NEAR receipts.
 
 ```
-Current:  agent-pay → REST withdraw → poll → poll → completed
-Native:   TEE → NEAR Intents deposit → NEAR Intents withdraw → callback → done
+Current:  agent-pay → REST withdraw → policy check → approved → poll → completed
+Native:   TEE → NEAR Intents deposit → NEAR Intents withdraw → policy check (in-enclave) → callback → done
 ```
 
 **Phase 4: 402 as a TEE primitive**
