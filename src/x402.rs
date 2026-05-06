@@ -199,7 +199,7 @@ impl PaymentProvider for MpcSolanaProvider {
         let (asset, is_native) = req.resolve();
 
         // Determine mode: pull (server broadcasts) if feePayerKey present, else push
-        let is_pull = req.fee_payer_key.is_some();
+        let is_pull = req.is_pull();
 
         // Sign the payment. Don't relay in pull mode — the server does it.
         let payment = sign_sol_payment(
@@ -209,8 +209,8 @@ impl PaymentProvider for MpcSolanaProvider {
             &req.recipient,
             amount,
             asset,
-            if !is_native { req.decimals } else { None },
-            req.fee_payer_key.as_deref(),
+            if !is_native { Some(req.decimals()) } else { None },
+            req.fee_payer_key(),
             !is_pull, // relay only in push mode
         )
         .await
@@ -243,29 +243,58 @@ impl PaymentProvider for MpcSolanaProvider {
         ))
     }
 }
+
+/// Solana Charge request inside MPP `WWW-Authenticate: Payment` header.
 ///
-/// Per draft-solana-charge-00:
-/// - `recipient`: base58-encoded pubkey receiving payment
-/// - `amount`: integer amount in base units
-/// - `currency`: "sol" for native, or base58 mint address for SPL tokens
-/// - `decimals`: required for SPL tokens (0–9)
-/// - `feePayerKey`: optional, server-sponsored fees
-/// - `externalId`: optional memo
+/// Decoded from the base64 `request` parameter. Real format from pay.sh:
+/// ```json
+/// {
+///   "amount": "10000",
+///   "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+///   "methodDetails": {
+///     "decimals": 6,
+///     "feePayer": true,
+///     "feePayerKey": "GHHL7yQ...",
+///     "network": "localnet",
+///     "recentBlockhash": "...",
+///     "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+///   },
+///   "recipient": "GHHL7yQ..."
+/// }
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct SolanaChargeRequest {
     pub recipient: String,
     pub amount: String,
-    /// "sol" for native SOL, or base58 mint address (e.g. USDC)
+    /// "sol" for native SOL, or base58 mint address for SPL tokens
     #[serde(default)]
     pub currency: Option<String>,
-    /// Required when currency is a mint address
+    /// Method-specific details (decimals, fee payer, network, etc.)
+    #[serde(default, rename = "methodDetails")]
+    pub method_details: Option<SolanaMethodDetails>,
+}
+
+/// Nested inside SolanaChargeRequest.methodDetails.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SolanaMethodDetails {
+    /// Token decimals (6 for USDC, 9 for native SOL)
     #[serde(default)]
     pub decimals: Option<u8>,
-    /// Server fee payer key (pull mode — server broadcasts)
+    /// Whether the server sponsors gas fees (pull mode)
+    #[serde(default, rename = "feePayer")]
+    pub fee_payer: Option<bool>,
+    /// The server's fee payer public key (pull mode — server broadcasts)
     #[serde(default, rename = "feePayerKey")]
     pub fee_payer_key: Option<String>,
-    #[serde(default, rename = "externalId")]
-    pub external_id: Option<String>,
+    /// Network: "mainnet-beta", "devnet", "localnet"
+    #[serde(default)]
+    pub network: Option<String>,
+    /// Recent blockhash for tx construction
+    #[serde(default, rename = "recentBlockhash")]
+    pub recent_blockhash: Option<String>,
+    /// SPL Token program ID
+    #[serde(default, rename = "tokenProgram")]
+    pub token_program: Option<String>,
 }
 
 impl SolanaChargeRequest {
@@ -274,23 +303,40 @@ impl SolanaChargeRequest {
         self.currency.as_deref() == Some("sol") || self.currency.is_none()
     }
 
-    /// Resolve the currency to a static asset string.
-    /// For native SOL → SOL_NATIVE. For SPL tokens → USDC_MINT or the raw mint.
+    /// Resolve the currency to a concrete asset string.
     /// Returns (asset_str, is_native).
-    ///
-    /// Note: for arbitrary SPL mints, the caller should use `self.currency` directly
-    /// since we can't return `&'static str` for a dynamic string.
     pub fn resolve(&self) -> (&str, bool) {
         if self.is_native_sol() {
             (crate::mpc::SOL_NATIVE, true)
         } else {
-            // Return the currency (mint address) from the struct
-            // Default to USDC if no currency specified and somehow not native
             match self.currency.as_deref() {
                 Some(mint) => (mint, false),
                 None => (crate::mpc::USDC_MINT, false),
             }
         }
+    }
+
+    /// Get decimals from methodDetails, defaulting to 9 for SOL, 6 for SPL.
+    pub fn decimals(&self) -> u8 {
+        self.method_details
+            .as_ref()
+            .and_then(|m| m.decimals)
+            .unwrap_or(if self.is_native_sol() { 9 } else { 6 })
+    }
+
+    /// Whether the server sponsors gas (pull mode).
+    pub fn is_pull(&self) -> bool {
+        self.method_details
+            .as_ref()
+            .and_then(|m| m.fee_payer)
+            .unwrap_or(false)
+    }
+
+    /// Get fee payer key if pull mode.
+    pub fn fee_payer_key(&self) -> Option<&str> {
+        self.method_details
+            .as_ref()
+            .and_then(|m| m.fee_payer_key.as_deref())
     }
 }
 
@@ -668,7 +714,7 @@ impl PayClient {
         let _ = self.ensure_funded(&sol_addr, needed).await;
 
         // Determine mode: pull if feePayerKey present, else push
-        let is_pull = req.fee_payer_key.is_some();
+        let is_pull = req.is_pull();
 
         let payment = sign_sol_payment(
             &self.mpc,
@@ -677,8 +723,8 @@ impl PayClient {
             &req.recipient,
             amount,
             asset,
-            if !is_native { req.decimals } else { None },
-            req.fee_payer_key.as_deref(),
+            if !is_native { Some(req.decimals()) } else { None },
+            req.fee_payer_key(),
             !is_pull,
         ).await?;
 
@@ -898,30 +944,48 @@ mod tests {
 
     #[test]
     fn test_solana_charge_request_decode() {
+        // Real format from pay.sh (native SOL)
         let json = serde_json::json!({
             "recipient": "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH",
             "amount": "1000000",
-            "currency": "sol"
+            "currency": "sol",
+            "methodDetails": {
+                "decimals": 9,
+                "network": "mainnet-beta"
+            }
         });
         let req: SolanaChargeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.amount, "1000000");
         assert_eq!(req.recipient, "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH");
         assert!(req.is_native_sol());
+        assert_eq!(req.decimals(), 9);
+        assert!(!req.is_pull());
     }
 
     #[test]
     fn test_solana_charge_request_spl() {
+        // Real format from pay.sh (USDC with fee payer = pull mode)
         let json = serde_json::json!({
-            "recipient": "GCn668EvNPWQSFpJK3CxgJhkVrzWb8VtrAHcLshWzViH",
-            "amount": "500000",
+            "recipient": "GHHL7yQBGdmRWUk7SPgXdMZ9LU5dJwRnE1EKFvqzDG6g",
+            "amount": "10000",
             "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "decimals": 6
+            "methodDetails": {
+                "decimals": 6,
+                "feePayer": true,
+                "feePayerKey": "GHHL7yQBGdmRWUk7SPgXdMZ9LU5dJwRnE1EKFvqzDG6g",
+                "network": "localnet",
+                "recentBlockhash": "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxx18e67b8b",
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            }
         });
         let req: SolanaChargeRequest = serde_json::from_value(json).unwrap();
         assert!(!req.is_native_sol());
         let (asset, is_native) = req.resolve();
         assert_eq!(asset, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
         assert!(!is_native);
+        assert_eq!(req.decimals(), 6);
+        assert!(req.is_pull());
+        assert_eq!(req.fee_payer_key(), Some("GHHL7yQBGdmRWUk7SPgXdMZ9LU5dJwRnE1EKFvqzDG6g"));
     }
 
     #[test]
