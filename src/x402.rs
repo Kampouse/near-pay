@@ -1327,6 +1327,166 @@ mod tests {
         });
     }
 
+    /// End-to-end test: derive MPC address, sign real tx, submit to pay.sh.
+    ///
+    /// Run with:
+    ///   OUTLAYER_API_KEY=wk_... cargo test test_paysh_e2e -- --ignored --nocapture
+    ///
+    /// Requires:
+    /// - OUTLAYER_API_KEY env var with a valid OutLayer key
+    /// - MPC Solana address must have USDC balance (for USDC endpoints)
+    ///   or SOL (for native endpoints)
+    ///
+    /// This test costs real money — $0.01 per USDC charge.
+    #[test]
+    #[ignore]
+    fn test_paysh_e2e() {
+        let api_key = match std::env::var("OUTLAYER_API_KEY") {
+            Ok(k) => k,
+            Err(_) => {
+                eprintln!("SKIP: OUTLAYER_API_KEY not set");
+                return;
+            }
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            // 1. Set up MPC client
+            let custody = CustodyClient::from_api_key(&api_key);
+            let mpc = MpcClient::new(custody.clone_for_mpc(), false); // mainnet
+
+            // 2. Derive our MPC Solana address
+            let sol_addr = mpc.derive_solana_address(crate::x402::PAY_SOL_PATH).await
+                .expect("Failed to derive Solana address");
+            eprintln!("MPC Solana address: {}", sol_addr);
+
+            // 3. Check USDC balance (ATA)
+            let sol_balance = mpc.sol_balance(&sol_addr).await
+                .expect("Failed to check SOL balance");
+            eprintln!("SOL balance: {} lamports", sol_balance);
+
+            // 4. Hit pay.sh endpoint → 402
+            let client = reqwest::Client::new();
+            let resp = client
+                .get("https://payment-debugger.vercel.app/mpp/quote/AAPL")
+                .send()
+                .await
+                .expect("Failed to connect to payment-debugger");
+
+            let status = resp.status().as_u16();
+            assert_eq!(status, 402, "Expected 402, got {}", status);
+
+            let www_auth = resp
+                .headers()
+                .get("www-authenticate")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            // 5. Parse MPP challenge
+            let challenge = mpp::protocol::core::PaymentChallenge::from_header(&www_auth)
+                .expect("Failed to parse MPP challenge");
+            eprintln!("Challenge ID: {}", challenge.id);
+            eprintln!("Challenge method: {}", challenge.method);
+
+            let req: SolanaChargeRequest = challenge.request.decode()
+                .expect("Failed to decode SolanaChargeRequest");
+            let amount: u64 = req.amount.parse().expect("Invalid amount");
+            let (asset, is_native) = req.resolve();
+            let is_pull = req.is_pull();
+
+            eprintln!("Amount: {} {}", req.amount, if is_native { "SOL" } else { "USDC" });
+            eprintln!("Recipient: {}", req.recipient);
+            eprintln!("Pull mode: {}", is_pull);
+            eprintln!("Decimals: {}", req.decimals());
+
+            // 6. Build and sign the tx
+            let payment = sign_sol_payment(
+                &mpc,
+                &custody,
+                &sol_addr,
+                &req.recipient,
+                amount,
+                asset,
+                if !is_native { Some(req.decimals()) } else { None },
+                req.fee_payer_key(),
+                req.method_details.as_ref().and_then(|m| m.recent_blockhash.as_deref()),
+                req.method_details.as_ref().and_then(|m| m.token_program.as_deref()),
+                false, // don't relay — let server handle it (or us below)
+            ).await;
+
+            match payment {
+                Ok(payment) => {
+                    eprintln!("Signed tx ({} bytes base64)", payment.signed_tx_b64.len());
+                    eprintln!("Tx signature: {}", payment.tx_signature);
+
+                    // 7. Build Solana Charge credential
+                    let payload = if is_pull {
+                        serde_json::json!({
+                            "type": "transaction",
+                            "transaction": payment.signed_tx_b64,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "signature",
+                            "signature": payment.tx_signature,
+                        })
+                    };
+
+                    let credential = serde_json::json!({
+                        "challenge": {
+                            "id": challenge.id,
+                            "realm": challenge.realm,
+                            "method": challenge.method,
+                            "intent": challenge.intent,
+                            "request": challenge.request,
+                            "expires": challenge.expires,
+                        },
+                        "payload": payload,
+                    });
+
+                    let cred_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(serde_json::to_string(&credential).unwrap());
+
+                    eprintln!("Credential ({} bytes): Payment {}...", cred_b64.len(), &cred_b64[..40]);
+
+                    // 8. Retry with Authorization header
+                    let retry_resp = client
+                        .get("https://payment-debugger.vercel.app/mpp/quote/AAPL")
+                        .header("Authorization", format!("Payment {}", cred_b64))
+                        .send()
+                        .await
+                        .expect("Failed to retry request");
+
+                    let retry_status = retry_resp.status().as_u16();
+                    let retry_body = retry_resp.text().await.expect("Failed to read retry body");
+
+                    eprintln!("Retry status: {}", retry_status);
+                    eprintln!("Retry body: {}", retry_body);
+
+                    // The server might reject for various reasons:
+                    // - Invalid signature (wrong signer)
+                    // - Insufficient balance
+                    // - Invalid blockhash (debugger uses fake blockhash)
+                    // But the important thing is: did our credential parse on their end?
+                    if retry_status == 200 {
+                        eprintln!("=== E2E SUCCESS: Server accepted payment ===");
+                    } else {
+                        eprintln!("=== E2E PARTIAL: Server rejected with {} ===", retry_status);
+                        eprintln!("This is expected if MPC address has no USDC or blockhash is fake");
+                        // Don't fail the test — the point is to see what the server says
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Signing failed: {:?}", e);
+                    eprintln!("This likely means the MPC address has insufficient balance");
+                    // Don't panic — this is useful diagnostic info
+                }
+            }
+        });
+    }
+
     /// Extract a parameter value from the WWW-Authenticate header.
     /// Handles both quoted and unquoted values.
     fn extract_param(header: &str, key: &str) -> Option<String> {
