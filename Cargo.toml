@@ -30,5 +30,5 @@ mpp = { version = "0.10.0", features = ["client"] }
 atty = "0.2"
 
 [[bin]]
-name = "agent-pay"
+name = "npay"
 path = "src/main.rs"

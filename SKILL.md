@@ -9,13 +9,13 @@ Multi-chain payment library + CLI for AI agents. NEAR custody (OutLayer) + MPC c
 cargo build --release
 
 # Discover APIs (no key needed)
-agent-pay search "ocr"
-agent-pay list
+npay search "ocr"
+npay list
 
 # Pay for an API call
 export OUTLAYER_API_KEY=wk_...
-agent-pay quicknode/rpc '{"method":"getHealth"}'
-echo '{"image":"..."}' | agent-pay alibaba/ocr-api
+npay quicknode/rpc '{"method":"getHealth"}'
+echo '{"image":"..."}' | npay alibaba/ocr-api
 
 # Library
 let mut pay = PayClient::new(CustodyClient::from_api_key(&key));

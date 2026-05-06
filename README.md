@@ -10,22 +10,22 @@ One Rust crate + CLI. One wallet. Any chain. Pay for APIs with HTTP 402. Send SO
 cargo install --path .
 
 # Discover providers (75 APIs on pay.sh)
-agent-pay search "ocr"
-agent-pay search "stock price"
-agent-pay list
-agent-pay info solana-foundation/alibaba/ocr-api
+npay search "ocr"
+npay search "stock price"
+npay list
+npay info solana-foundation/alibaba/ocr-api
 
 # Call by FQN — resolves service_url from pay.sh catalog
-agent-pay quicknode/rpc '{"method":"getHealth"}'
+npay quicknode/rpc '{"method":"getHealth"}'
 
 # Pipe body from stdin
-echo '{"image":"base64..."}' | agent-pay alibaba/ocr-api
+echo '{"image":"base64..."}' | npay alibaba/ocr-api
 
 # Call any URL directly
-agent-pay https://payment-debugger.vercel.app/mpp/quote/AAPL
+npay https://payment-debugger.vercel.app/mpp/quote/AAPL
 
 # Fuzzy match — one word is enough if unambiguous
-agent-pay quicknode
+npay quicknode
 ```
 
 Requires `OUTLAYER_API_KEY=wk_...` for payments. Catalog commands (search/list/info) work without it.

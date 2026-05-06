@@ -75,24 +75,24 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("agent-pay — pay.sh client for AI agents");
+    eprintln!("npay — pay.sh client for AI agents");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  agent-pay <fqn> [body]         Call a provider (e.g. quicknode/rpc)");
-    eprintln!("  agent-pay <url>                 Call a URL directly");
-    eprintln!("  agent-pay search <query>        Search the pay.sh catalog");
-    eprintln!("  agent-pay list                  List all providers");
-    eprintln!("  agent-pay info <fqn>            Show provider details");
+    eprintln!("  npay <fqn> [body]              Call a provider (e.g. quicknode/rpc)");
+    eprintln!("  npay <url>                     Call a URL directly");
+    eprintln!("  npay search <query>            Search the pay.sh catalog");
+    eprintln!("  npay list                      List all providers");
+    eprintln!("  npay info <fqn>                Show provider details");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  OUTLAYER_API_KEY   Required for signing payments");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  agent-pay search \"stock price\"");
-    eprintln!("  agent-pay info quicknode/rpc");
-    eprintln!("  agent-pay quicknode/rpc '{{\"method\":\"getHealth\"}}'");
-    eprintln!("  echo '{{\"image\":\"...\"}}' | agent-pay solana-foundation/alibaba/ocr-api");
-    eprintln!("  agent-pay https://payment-debugger.vercel.app/mpp/quote/AAPL");
+    eprintln!("  npay search \"stock price\"");
+    eprintln!("  npay info quicknode/rpc");
+    eprintln!("  npay quicknode/rpc '{{\"method\":\"getHealth\"}}'");
+    eprintln!("  echo '{{\"image\":\"...\"}}' | npay alibaba/ocr-api");
+    eprintln!("  npay https://payment-debugger.vercel.app/mpp/quote/AAPL");
 }
 
 fn read_stdin() -> Option<String> {
