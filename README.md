@@ -214,11 +214,11 @@ ed25519-dalek = "2"       # Ed25519 types
 
 Notably absent: `x402-rs` and `solana-mpp`. Both have atomic crate conflicts with `solana-sdk v2`. We hand-roll x402 parsing and use the `mpp` crate for MPP only.
 
-## Current status
+## Current blockers
 
-1. **Withdraw policy** — `intents_withdraw` returns `pending_approval` when the agent's policy doesn't auto-approve the operation. This is by design: OutLayer policies are safeguards that let you control what your agent can do autonomously. Configure auto-approve rules for expected operations (see Phase 5 in the native integration section).
+1. **OutLayer withdraw approval** — `intents_withdraw` returns `pending_approval`. Requires manual approval in the OutLayer dashboard. No programmatic API. Blocks auto-fund and cross-chain sends until resolved.
 
-2. **MPC address funding** — The MPC-derived Solana address starts at 0 SOL. The balance gate catches this cleanly with `InsufficientBalance`. Auto-fund is wired and will work once the withdraw policy allows it. Manual SOL transfer to the MPC address works immediately.
+2. **MPC address has 0 SOL** — The balance gate catches this cleanly with `InsufficientBalance`. Auto-fund is wired but blocked by #1. Manual SOL transfer to the MPC address works as a workaround.
 
 ---
 
@@ -241,11 +241,13 @@ agent-pay is an external client that calls OutLayer's REST API. Everything it do
 
 1. **No API key** — the TEE already holds the identity. No `wk_4f3e...` key to leak or rotate.
 
-2. **No external signing roundtrip** — MPC signing is already inside the TEE. No REST call to yourself. Just call the contract directly.
+2. **No pending_approval** — the TEE IS the approval. Policy checks happen inside the enclave, not in a dashboard. Cross-chain sends become instant.
 
-3. **Self-healing is trivial** — the TEE can monitor its own Solana balance and refill from Intents without polling.
+3. **No external signing roundtrip** — MPC signing is already inside the TEE. No REST call to yourself. Just call the contract directly.
 
-4. **x402/MPP becomes a TEE capability** — the agent asks "pay this API" and the TEE handles everything: detect protocol, sign, relay, retry.
+4. **Self-healing is trivial** — the TEE can monitor its own Solana balance and refill from Intents without polling.
+
+5. **x402/MPP becomes a TEE capability** — the agent asks "pay this API" and the TEE handles everything: detect protocol, sign, relay, retry.
 
 ### Implementation path
 
@@ -271,11 +273,11 @@ Native:   TEE signs → TEE relays to Solana → returns tx_hash
 
 **Phase 3: Internal Intents**
 
-Cross-chain sends happen inside the TEE. The agent's policy controls auto-approval. No polling — event-driven via NEAR receipts.
+Cross-chain sends happen inside the TEE. No `pending_approval` — the TEE's policy engine decides. No polling — event-driven via NEAR receipts.
 
 ```
-Current:  agent-pay → REST withdraw → policy check → approved → poll → completed
-Native:   TEE → NEAR Intents deposit → NEAR Intents withdraw → policy check (in-enclave) → callback → done
+Current:  agent-pay → REST withdraw → poll → poll → completed
+Native:   TEE → NEAR Intents deposit → NEAR Intents withdraw → callback → done
 ```
 
 **Phase 4: 402 as a TEE primitive**
@@ -289,26 +291,23 @@ let data = custody.fetch_paid("https://api.example.com/data", max_sol: 0.001).aw
 
 The agent never sees the payment mechanics. It just gets the data.
 
-**Phase 5: Policy engine — prevent agents from going wild**
+**Phase 5: Policy as code**
 
-Programmable guardrails so the agent can't drain the wallet or pay random addresses:
+Replace the dashboard approval with programmable policies:
 
 ```rust
-// Auto-approve small routine payments
+// Auto-approve sends under 1 NEAR equivalent
 policy.auto_approve(|req| req.usd_value() < 1.0);
 
-// Require explicit approval for large sends
+// Require explicit approval for sends over 10 NEAR
 policy.require_approval(|req| req.usd_value() >= 10.0);
 
-// Only pay whitelisted API domains
+// Whitelist specific API domains for 402
 policy.allow_402_domain("api.openai.com");
 policy.allow_402_domain("api.anthropic.com");
-
-// Only send to whitelisted addresses
-policy.allow_destination("solana", "GCn6...WzViH");
 ```
 
-The policy runs inside the TEE. The agent can't bypass it. If it tries something outside policy bounds, it gets rejected. No human in the loop unless the policy says so.
+Policies execute inside the TEE. No human in the loop unless the policy says so.
 
 ### What agent-pay becomes
 

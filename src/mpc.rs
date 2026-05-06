@@ -264,6 +264,40 @@ impl MpcClient {
         }
     }
 
+    /// Build an SPL Token TransferChecked instruction (instruction 13).
+    ///
+    /// Required by Solana Charge (draft-solana-charge-00) for SPL token payments.
+    /// Includes the mint account and decimals, allowing the receiver to verify
+    /// the token type and amount.
+    ///
+    /// Wire format:
+    /// - Accounts: [source_ata (writable), mint (readonly), dest_ata (writable), owner]
+    /// - Data: 4 bytes discriminator (13u32 LE) + 8 bytes amount LE + 1 byte decimals
+    fn spl_transfer_checked_ix(
+        source: Pubkey,
+        mint: Pubkey,
+        destination: Pubkey,
+        authority: Pubkey,
+        amount: u64,
+        decimals: u8,
+    ) -> Instruction {
+        let program_id = Pubkey::try_from(TOKEN_PROGRAM).unwrap();
+        let mut data = Vec::with_capacity(13);
+        data.extend_from_slice(&13u32.to_le_bytes()); // TransferChecked discriminator
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.push(decimals);
+        Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(source, false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new_readonly(authority, true),
+            ],
+            data,
+        }
+    }
+
     /// Build an SPL token transfer transaction.
     ///
     /// Same pipeline as `build_sol_transfer` but with a Token Transfer
@@ -313,6 +347,42 @@ impl MpcClient {
         } else {
             self.build_spl_transfer(from, to, asset, amount).await
         }
+    }
+
+    /// Build an SPL Token TransferChecked transaction (instruction 13).
+    ///
+    /// Required by Solana Charge (draft-solana-charge-00) for SPL token payments.
+    /// Unlike `build_spl_transfer` (instruction 12), this includes the mint
+    /// account and decimals in the instruction, allowing the receiver to verify
+    /// the token type and amount without prior knowledge.
+    pub async fn build_spl_transfer_checked(
+        &self,
+        from: &str,
+        to: &str,
+        mint: &str,
+        amount: u64,
+        decimals: u8,
+    ) -> Result<Transaction> {
+        let from_pubkey = Pubkey::try_from(from)
+            .map_err(|e| Error::Api(format!("Invalid from address: {}", e)))?;
+        let to_pubkey = Pubkey::try_from(to)
+            .map_err(|e| Error::Api(format!("Invalid to address: {}", e)))?;
+        let mint_pubkey = Pubkey::try_from(mint)
+            .map_err(|e| Error::Api(format!("Invalid mint address: {}", e)))?;
+
+        let source_ata = Self::derive_ata(&from_pubkey, &mint_pubkey);
+        let dest_ata = Self::derive_ata(&to_pubkey, &mint_pubkey);
+
+        let ix = Self::spl_transfer_checked_ix(source_ata, mint_pubkey, dest_ata, from_pubkey, amount, decimals);
+
+        let blockhash = self.get_solana_blockhash().await?;
+        let message = Message::new_with_blockhash(&[ix], Some(&from_pubkey), &blockhash);
+        let tx = Transaction {
+            signatures: vec![SolanaSignature::default()],
+            message,
+        };
+
+        Ok(tx)
     }
 
     // ─── Step 3: Request MPC Signature ─────────────────────────────────
@@ -705,6 +775,38 @@ mod tests {
         assert_eq!(disc, 12u32, "Transfer discriminator must be 12");
         let amt = u64::from_le_bytes(ix.data[4..12].try_into().unwrap());
         assert_eq!(amt, 1_000_000);
+    }
+
+    #[test]
+    fn test_spl_transfer_checked_ix_encoding() {
+        // Verify instruction 13 (TransferChecked) encoding
+        let source = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let dest = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let amount: u64 = 2_500_000; // 2.5 USDC
+        let decimals: u8 = 6;
+
+        let ix = MpcClient::spl_transfer_checked_ix(source, mint, dest, authority, amount, decimals);
+
+        // Must target Token program
+        assert_eq!(ix.program_id, Pubkey::try_from(TOKEN_PROGRAM).unwrap());
+
+        // 4 accounts: source (writable), mint (readonly), dest (writable), authority (signer)
+        assert_eq!(ix.accounts.len(), 4);
+        assert!(ix.accounts[0].is_writable);  // source
+        assert!(!ix.accounts[1].is_writable); // mint
+        assert!(ix.accounts[2].is_writable);  // dest
+        assert!(!ix.accounts[3].is_writable); // authority
+        assert!(ix.accounts[3].is_signer);    // authority signs
+
+        // Data: 4 bytes discriminator + 8 bytes amount + 1 byte decimals = 13 bytes
+        assert_eq!(ix.data.len(), 13);
+        let disc = u32::from_le_bytes(ix.data[0..4].try_into().unwrap());
+        assert_eq!(disc, 13u32, "TransferChecked discriminator must be 13");
+        let amt = u64::from_le_bytes(ix.data[4..12].try_into().unwrap());
+        assert_eq!(amt, 2_500_000);
+        assert_eq!(ix.data[12], 6u8, "decimals byte");
     }
 
     #[test]

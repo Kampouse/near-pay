@@ -39,14 +39,32 @@ const PAY_SOL_PATH: &str = "solana-pay-0";
 /// Routes to SOL or SPL based on `asset`:
 /// - `SOL_NATIVE` (all 1s) → native SystemProgram transfer
 /// - anything else → SPL Token transfer (asset = mint address)
-async fn execute_sol_payment(
+/// Result of building + signing a Solana payment.
+/// Used to construct the Solana Charge credential.
+struct SignedPayment {
+    /// Base64-encoded serialized signed transaction (for pull mode credential).
+    signed_tx_b64: String,
+    /// Base58-encoded transaction signature (for push mode credential).
+    tx_signature: String,
+}
+
+/// Build, sign, and optionally relay a Solana payment.
+///
+/// If `relay` is true (push mode), broadcasts to Solana RPC.
+/// If `relay` is false (pull mode), returns the signed tx without broadcasting.
+///
+/// Returns the signed tx bytes (base64) and the tx signature (base58).
+async fn sign_sol_payment(
     mpc: &MpcClient,
     _custody: &CustodyClient,
     sol_addr: &str,
     pay_to: &str,
     amount: u64,
     asset: &str,
-) -> Result<String> {
+    decimals: Option<u8>,
+    fee_payer: Option<&str>,
+    relay: bool,
+) -> Result<SignedPayment> {
     // Balance gate: check before building tx
     let balance = mpc.sol_balance(sol_addr).await?;
     let needed = if asset == crate::mpc::SOL_NATIVE {
@@ -67,10 +85,51 @@ async fn execute_sol_payment(
         });
     }
 
-    let tx = mpc.build_transfer(sol_addr, pay_to, amount, asset).await?;
+    // Build the transfer instruction
+    let tx = if asset == crate::mpc::SOL_NATIVE {
+        mpc.build_sol_transfer(sol_addr, pay_to, amount).await?
+    } else {
+        mpc.build_spl_transfer_checked(sol_addr, pay_to, asset, amount, decimals.unwrap_or(6)).await?
+    };
+
+    // If fee payer is provided (pull mode), set the fee payer on the tx
+    // The server will co-sign with its fee payer key before broadcasting
+    let tx = if let Some(_fp) = fee_payer {
+        // TODO: set tx.message.account_keys[0] = fee_payer
+        // For now the server handles this
+        tx
+    } else {
+        tx
+    };
+
     let signature = mpc.sign_transaction(&tx, PAY_SOL_PATH).await?;
-    let signed = mpc.finalize_transaction(&tx, sol_addr, &signature)?;
-    mpc.relay_to_solana(&signed).await
+    let signed_bytes = mpc.finalize_transaction(&tx, sol_addr, &signature)?;
+
+    // The tx signature is the first (only) signature on the signed tx
+    let tx_sig = bs58::encode(&signature).into_string();
+    let signed_b64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
+
+    if relay {
+        mpc.relay_to_solana(&signed_bytes).await?;
+    }
+
+    Ok(SignedPayment {
+        signed_tx_b64: signed_b64,
+        tx_signature: tx_sig,
+    })
+}
+
+/// Legacy helper: build, sign, relay — returns tx hash only.
+async fn execute_sol_payment(
+    mpc: &MpcClient,
+    custody: &CustodyClient,
+    sol_addr: &str,
+    pay_to: &str,
+    amount: u64,
+    asset: &str,
+) -> Result<String> {
+    let payment = sign_sol_payment(mpc, custody, sol_addr, pay_to, amount, asset, None, None, true).await?;
+    Ok(payment.tx_signature)
 }
 
 // ─── MPP PaymentProvider ─────────────────────────────────────────────
@@ -137,17 +196,50 @@ impl PaymentProvider for MpcSolanaProvider {
             })?;
 
         // Resolve asset: native SOL or SPL token mint
-        let (asset, _is_native) = req.resolve();
+        let (asset, is_native) = req.resolve();
 
-        let tx_hash = execute_sol_payment(&self.mpc, &self.custody, &sol_addr, &req.recipient, amount, asset)
-            .await
-            .map_err(|e| mpp::error::MppError::Http(format!("Payment failed: {}", e)))?;
+        // Determine mode: pull (server broadcasts) if feePayerKey present, else push
+        let is_pull = req.fee_payer_key.is_some();
 
-        // Build Solana Charge credential (push mode: signature)
+        // Sign the payment. Don't relay in pull mode — the server does it.
+        let payment = sign_sol_payment(
+            &self.mpc,
+            &self.custody,
+            &sol_addr,
+            &req.recipient,
+            amount,
+            asset,
+            if !is_native { req.decimals } else { None },
+            req.fee_payer_key.as_deref(),
+            !is_pull, // relay only in push mode
+        )
+        .await
+        .map_err(|e| mpp::error::MppError::Http(format!("Payment failed: {}", e)))?;
+
+        // Build Solana Charge credential per draft-solana-charge-00.
+        // The credential is a JSON envelope: { challenge, payload }.
+        // We bypass the MPP crate's format_authorization because Solana Charge
+        // uses "transaction" field instead of "signature", and "signature" for push mode.
+        let payload_json = if is_pull {
+            serde_json::json!({
+                "type": "transaction",
+                "transaction": payment.signed_tx_b64,
+            })
+        } else {
+            serde_json::json!({
+                "type": "signature",
+                "signature": payment.tx_signature,
+            })
+        };
+
+        // The MPP crate's PaymentCredential won't produce the right format.
+        // Instead we encode directly as the MPP crate would but with Solana Charge fields.
+        // Use hash payload as a carrier — the handle_mpp() method on PayClient
+        // will build the proper Authorization header.
         let echo = challenge.to_echo();
         Ok(PaymentCredential::new(
             echo,
-            MppPayload::hash(tx_hash),
+            MppPayload::hash(serde_json::to_string(&payload_json).unwrap_or_default()),
         ))
     }
 }
@@ -569,23 +661,58 @@ impl PayClient {
         let sol_addr = self.ensure_sol_address().await?.to_string();
 
         // Resolve asset from Solana Charge fields
-        let (asset, _is_native) = req.resolve();
+        let (asset, is_native) = req.resolve();
 
         // Auto-fund if balance too low
         let needed = if req.is_native_sol() { amount } else { 0 };
         let _ = self.ensure_funded(&sol_addr, needed).await;
 
-        let tx_hash = execute_sol_payment(&self.mpc, &self.custody, &sol_addr, &req.recipient, amount, asset).await?;
+        // Determine mode: pull if feePayerKey present, else push
+        let is_pull = req.fee_payer_key.is_some();
 
-        let credential = PaymentCredential::new(
-            challenge.to_echo(),
-            MppPayload::hash(tx_hash),
-        );
-        let auth_header = mpp::protocol::core::format_authorization(&credential)
-            .map_err(|e| Error::X402(format!("MPP credential error: {}", e)))?;
+        let payment = sign_sol_payment(
+            &self.mpc,
+            &self.custody,
+            &sol_addr,
+            &req.recipient,
+            amount,
+            asset,
+            if !is_native { req.decimals } else { None },
+            req.fee_payer_key.as_deref(),
+            !is_pull,
+        ).await?;
+
+        // Build Solana Charge credential JSON
+        let payload = if is_pull {
+            serde_json::json!({
+                "type": "transaction",
+                "transaction": payment.signed_tx_b64,
+            })
+        } else {
+            serde_json::json!({
+                "type": "signature",
+                "signature": payment.tx_signature,
+            })
+        };
+
+        let credential = serde_json::json!({
+            "challenge": {
+                "id": challenge.id,
+                "realm": challenge.realm,
+                "method": challenge.method,
+                "intent": challenge.intent,
+                "request": challenge.request,
+                "expires": challenge.expires,
+            },
+            "payload": payload,
+        });
+
+        // Base64url-encode the credential for the Authorization header
+        let cred_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&credential).unwrap_or_default());
 
         let mut retry_headers = extra_headers;
-        retry_headers.push(("Authorization".to_string(), auth_header));
+        retry_headers.push(("Authorization".to_string(), format!("Payment {}", cred_b64)));
 
         let retry_resp = self.raw_request(method, url, &body, &retry_headers).await?;
         let retry_status = retry_resp.status().as_u16();
@@ -595,7 +722,7 @@ impl PayClient {
             status: retry_status,
             body: retry_body,
             amount_paid: amount_str,
-            token: "sol".to_string(),
+            token: req.currency.unwrap_or_else(|| "sol".to_string()),
         })
     }
 
